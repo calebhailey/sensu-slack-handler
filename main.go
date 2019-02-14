@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+  "bytes"
 	"io/ioutil"
 	"log"
 	"os"
 	"path"
 	"strings"
+  "text/template"
 
 	"github.com/bluele/slack"
 	"github.com/sensu/sensu-go/types"
@@ -23,11 +25,12 @@ type HandlerConfigOption struct {
 
 type HandlerConfig struct {
 	SlackWebhookUrl HandlerConfigOption
-	SlackChannel    HandlerConfigOption
-	SlackUsername   HandlerConfigOption
-	SlackIconUrl    HandlerConfigOption
-	Timeout         int
-	Keyspace        string
+	SlackChannel               HandlerConfigOption
+	SlackUsername              HandlerConfigOption
+	SlackIconUrl               HandlerConfigOption
+  SlackDescriptionTemplate   HandlerConfigOption
+	Timeout                    int
+	Keyspace                   string
 }
 
 var (
@@ -35,11 +38,12 @@ var (
 	config = HandlerConfig{
 		// default values
 		SlackWebhookUrl: HandlerConfigOption{Path: "webhook-url", Env: "SENSU_SLACK_WEHBOOK_URL"},
-		SlackChannel:    HandlerConfigOption{Path: "channel", Env: "SENSU_SLACK_CHANNEL"},
-		SlackUsername:   HandlerConfigOption{Path: "username", Env: "SENSU_SLACK_USERNAME"},
-		SlackIconUrl:    HandlerConfigOption{Path: "icon-url", Env: "SENSU_SLACK_ICON_URL"},
-		Timeout:         10,
-		Keyspace:        "sensu.io/plugins/slack/config",
+		SlackChannel:               HandlerConfigOption{Path: "channel", Env: "SENSU_SLACK_CHANNEL"},
+		SlackUsername:              HandlerConfigOption{Path: "username", Env: "SENSU_SLACK_USERNAME"},
+		SlackIconUrl:               HandlerConfigOption{Path: "icon-url", Env: "SENSU_SLACK_ICON_URL"},
+    SlackDescriptionTemplate:   HandlerConfigOption{Path: "description-template", Env: "SENSU_SLACK_DESCRIPTION_TEMPLATE"},
+		Timeout:                    10,
+		Keyspace:                   "sensu.io/plugins/slack/config",
 	}
 	options = []*HandlerConfigOption{
 		// iterable slice of user-overridable configuration options
@@ -47,6 +51,7 @@ var (
 		&config.SlackChannel,
 		&config.SlackUsername,
 		&config.SlackIconUrl,
+    &config.SlackDescriptionTemplate,
 	}
 )
 
@@ -70,35 +75,53 @@ func configureRootCommand() *cobra.Command {
 		do not mark as required
 		manually test for empty value
 	*/
-	cmd.Flags().StringVarP(&config.SlackWebhookUrl.Value,
+	cmd.Flags().StringVarP(
+    &config.SlackWebhookUrl.Value,
 		"webhook-url",
 		"w",
 		os.Getenv("SLACK_WEBHOOK_URL"),
-		"The webhook url to send messages to, defaults to value of SLACK_WEBHOOK_URL env variable")
+		"The webhook url to send messages to, defaults to value of SLACK_WEBHOOK_URL env variable",
+  )
 
-	cmd.Flags().StringVarP(&config.SlackChannel.Value,
+	cmd.Flags().StringVarP(
+    &config.SlackChannel.Value,
 		"channel",
 		"c",
 		"#general",
-		"The channel to post messages to")
+		"The channel to post messages to",
+  )
 
-	cmd.Flags().StringVarP(&config.SlackUsername.Value,
+	cmd.Flags().StringVarP(
+    &config.SlackUsername.Value,
 		"username",
 		"u",
 		"sensu",
-		"The username that messages will be sent as")
+		"The username that messages will be sent as",
+  )
 
-	cmd.Flags().StringVarP(&config.SlackIconUrl.Value,
+  cmd.Flags().StringVarP(
+    &config.SlackIconUrl.Value,
 		"icon-url",
 		"i",
 		"http://s3-us-west-2.amazonaws.com/sensuapp.org/sensu.png",
-		"A URL to an image to use as the user avatar")
+		"A URL to an image to use as the user avatar",
+  )
 
-	cmd.Flags().IntVarP(&config.Timeout,
+  cmd.Flags().StringVarP(
+    &config.SlackDescriptionTemplate.Value,
+		"description-template",
+		"d",
+		"{{ .Check.Output }}",
+		"The template to use to format the Slack message output.",
+  )
+
+	cmd.Flags().IntVarP(
+    &config.Timeout,
 		"timeout",
 		"t",
 		10,
-		"The amount of seconds to wait before terminating the handler")
+		"The amount of seconds to wait before terminating the handler",
+  )
 
 	return cmd
 }
@@ -157,6 +180,9 @@ func configurationOverrides(config *HandlerConfig, options []*HandlerConfigOptio
 			case event.Entity.Annotations[k] != "":
 				opt.Value = event.Entity.Annotations[k]
 				log.Printf("Overriding default handler configuration with value of \"Entity.Annotations.%s\" (\"%s\")\n", k, event.Entity.Annotations[k])
+      case os.Getenv(opt.Env) != "":
+        opt.Value = os.Getenv(opt.Env)
+        log.Printf("Overriding default handler configuration with value of \"%s\" environment variable (\"%s\")", opt.Env, os.Getenv(opt.Env))
 			}
 		}
 	}
@@ -191,6 +217,15 @@ func formattedMessage(event *types.Event) string {
 	return fmt.Sprintf("%s - %s", formattedEventAction(event), eventSummary(event, 100))
 }
 
+func templatedMessage(event *types.Event, templateText string) string {
+  message := new(bytes.Buffer)
+  t, err := template.New("slackMessage").Parse(templateText)
+  if err != nil { log.Fatal(err) }
+  err = t.Execute(message, event)
+  if err != nil { log.Fatal(err) }
+  return message.String()
+}
+
 func messageColor(event *types.Event) string {
 	switch event.Check.Status {
 	case 0:
@@ -216,23 +251,23 @@ func messageStatus(event *types.Event) string {
 func messageAttachment(event *types.Event) *slack.Attachment {
 	attachment := &slack.Attachment{
 		Title:    "Description",
-		Text:     event.Check.Output,
+		Text:     templatedMessage(event,config.SlackDescriptionTemplate.Value),
 		Fallback: formattedMessage(event),
 		Color:    messageColor(event),
 		Fields: []*slack.AttachmentField{
-			&slack.AttachmentField{
-				Title: "Status",
-				Value: messageStatus(event),
-				Short: false,
-			},
-			&slack.AttachmentField{
+      &slack.AttachmentField{
 				Title: "Entity",
 				Value: event.Entity.Name,
-				Short: true,
+				Short: false,
 			},
 			&slack.AttachmentField{
 				Title: "Check",
 				Value: event.Check.Name,
+				Short: true,
+			},
+      &slack.AttachmentField{
+				Title: "Status",
+				Value: messageStatus(event),
 				Short: true,
 			},
 		},
